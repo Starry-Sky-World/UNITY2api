@@ -15,7 +15,7 @@ OpenAI 兼容的代理服务，使你可以免费在 api 中使用来自 [厦门
 <div align="right">
   <sub>
     <span style="color: gray;">
-      <strong>[1]]:</strong><br>
+      <strong>[1]:</strong><br>
       以上所有数据、描述及形容词均 100% 来自 <strong>xiamenlabs</strong> 的官方网站。<br>
       <strong>本项目维护者仅负责执行 Ctrl+C 和 Ctrl+V 操作。</strong><br>
       本项目不对以上描述的真实性做出任何明示或暗示的担保。<br>
@@ -75,7 +75,7 @@ cp .env.example .env
 
 ## License
 
-项目基于 MIT Licence 开源，但是这个readme里面的一些图片除外，它们是保留所有权利的。
+项目基于 MIT License 开源，但是这个readme里面的一些图片除外，它们是保留所有权利的。
 
 ## 铁打的距离感
 
