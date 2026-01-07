@@ -1,16 +1,45 @@
-# OpenAI Proxy for xiamenlabs.com
+# UNITY2api
 
-OpenAI 兼容的代理服务，将 xiamenlabs.com 的免费 chat API 转换为标准 OpenAI 格式。
+<div style="font-size: 13px; color: #54595d; font-style: italic;">
+  <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/7/72/Disambig.svg/20px-Disambig.svg.png" width="20" alt="消歧义图标" style="vertical-align: middle; margin-right: 5px;">
+  本项目名称中的 UNITY 不指代 <a href="https://unity.com">Unity (游戏引擎)</a>。如果你正在寻找与<a href="https://unity.com">Unity (游戏引擎)</a>有关的项目，请参阅 <a href="https://www.youtube.com/watch?v=dQw4w9WgXcQ">UNITY (消歧义页)</a>。
+</div>
+<hr>
+
+![usage](readmeme/usage.png)
+
+OpenAI 兼容的代理服务，使你可以免费在 api 中使用来自 [厦门实验室](https://xiamenlabs.com) 的 UNITY 模型。*该模型在[核心性能深度评估报告 · 最终修订版本 - 2026 官方审计版本
+](https://www.youtube.com/watch?v=dQw4w9WgXcQ)中表现优异，以 [综合性能指数
+](https://www.youtube.com/watch?v=dQw4w9WgXcQ) 4.7% 的巨大优势超过了 Gemini 3 Pro，成为世界上最强大的大型语言模型，简直是厦门人的骄傲\~*[1]
+
+<div align="right">
+  <sub>
+    <span style="color: gray;">
+      <strong>[1]]:</strong><br>
+      以上所有数据、描述及形容词均 100% 来自 <strong>xiamenlabs</strong> 的官方网站。<br>
+      <strong>本项目维护者仅负责执行 Ctrl+C 和 Ctrl+V 操作。</strong><br>
+      本项目不对以上描述的真实性做出任何明示或暗示的担保。<br>
+      <em>苦一苦厦门，骂名我来当。</em>
+    </span>
+  </sub>
+</div>
+<hr>
 
 ## 特性
 
-- ✅ **OpenAI 兼容**：完全兼容 OpenAI SDK 和 API 格式
-- 🧠 **思考过程可见**：将 reasoning 包裹在 `<think></think>` 标签中
-- 🖼️ **多模态支持**：支持图片 + 文本输入（Vision）
-- 🚀 **流式输出**：保持实时流式响应
+- ✅ **无需鉴权**：目标 API 无需任何认证
+- 🧠 **无需鉴权**：目标 API 无需任何认证
+- 🖼️ **无需鉴权**：目标 API 无需任何认证
+- 🚀 **无需鉴权**：目标 API 无需任何认证
 - 🔓 **无需鉴权**：目标 API 无需任何认证
 
 ## 快速开始
+
+### 克隆项目
+
+![1](readmeme/clone.png)
+
+You know M3?
 
 ### 安装依赖
 
@@ -24,214 +53,30 @@ npm install
 npm start
 ```
 
-服务将运行在 `http://localhost:3000`
+服务将运行在 `http://localhost:3000` ，然后就可以用了。
+![zimin](readmeme/zimin.png)
+模型名称和 API Key 埃及吧写啥写啥，都能给你中转过去。
 
-### 配置（可选）
+### 配置
 
-复制 `.env.example` 为 `.env` 并修改端口：
+![mortis](readmeme/mortis.png)
+
+如果你真的要改些什么的话，
+
+你可以复制 `.env.example` 为 `.env` 并修改端口：
 
 ```bash
 cp .env.example .env
 ```
 
-## 使用示例
-
-### cURL
-
-```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [
-      {"role": "user", "content": "你好"}
-    ],
-    "stream": true
-  }'
-```
-
-### Python (OpenAI SDK)
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:3000/v1",
-    api_key="dummy"  # 不需要真实 API key
-)
-
-response = client.chat.completions.create(
-    model="gpt-4",
-    messages=[
-        {"role": "user", "content": "你好"}
-    ],
-    stream=True
-)
-
-for chunk in response:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
-```
-
-### Node.js (OpenAI SDK)
-
-```javascript
-import OpenAI from 'openai';
-
-const client = new OpenAI({
-  baseURL: 'http://localhost:3000/v1',
-  apiKey: 'dummy'
-});
-
-const stream = await client.chat.completions.create({
-  model: 'gpt-4',
-  messages: [{ role: 'user', content: '你好' }],
-  stream: true,
-});
-
-for await (const chunk of stream) {
-  process.stdout.write(chunk.choices[0]?.delta?.content || '');
-}
-```
-
-### 多模态（图片 + 文本）
-
-#### Python
-
-```python
-import base64
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:3000/v1",
-    api_key="dummy"
-)
-
-# 读取本地图片并编码为 base64
-with open("image.jpg", "rb") as f:
-    image_data = base64.b64encode(f.read()).decode('utf-8')
-
-response = client.chat.completions.create(
-    model="gpt-4-vision-preview",
-    messages=[
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "这张图片里有什么？"},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{image_data}"
-                    }
-                }
-            ]
-        }
-    ],
-    stream=True
-)
-
-for chunk in response:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
-```
-
-#### Node.js
-
-```javascript
-import OpenAI from 'openai';
-import fs from 'fs';
-
-const client = new OpenAI({
-  baseURL: 'http://localhost:3000/v1',
-  apiKey: 'dummy'
-});
-
-// 读取本地图片并编码为 base64
-const imageBuffer = fs.readFileSync('image.jpg');
-const base64Image = imageBuffer.toString('base64');
-
-const stream = await client.chat.completions.create({
-  model: 'gpt-4-vision-preview',
-  messages: [
-    {
-      role: 'user',
-      content: [
-        { type: 'text', text: '这张图片里有什么？' },
-        {
-          type: 'image_url',
-          image_url: {
-            url: `data:image/jpeg;base64,${base64Image}`
-          }
-        }
-      ]
-    }
-  ],
-  stream: true,
-});
-
-for await (const chunk of stream) {
-  process.stdout.write(chunk.choices[0]?.delta?.content || '');
-}
-```
-
-#### cURL
-
-```bash
-# 需要先将图片转为 base64
-base64_image=$(base64 -w 0 image.jpg)
-
-curl http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"model\": \"gpt-4-vision-preview\",
-    \"messages\": [
-      {
-        \"role\": \"user\",
-        \"content\": [
-          {\"type\": \"text\", \"text\": \"这张图片里有什么？\"},
-          {
-            \"type\": \"image_url\",
-            \"image_url\": {
-              \"url\": \"data:image/jpeg;base64,$base64_image\"
-            }
-          }
-        ]
-      }
-    ],
-    \"stream\": true
-  }"
-```
-```
-
-## 响应格式
-
-代理会将目标 API 的响应转换为 OpenAI 格式：
-
-- `reasoning` 字段 → 包裹在 `<think>...</think>` 中
-- `content` 字段 → 正常输出
-
-示例输出：
-```
-<think>
-**接收消息**
-我收到了你的最新消息...
-**理解意图**
-我正在思考你发送这个消息的潜在意图...
-</think>
-你好！很高兴见到你，请问有什么我可以帮你的吗？
-```
-
 ## API 端点
 
-- `POST /v1/chat/completions` - Chat completions (兼容 OpenAI)
-- `GET /health` - 健康检查
-
-## 技术栈
-
-- **Node.js 18+** - 使用原生 fetch API
-- **Express** - HTTP 服务器
-- **SSE** - 服务器推送事件流式响应
+- `POST /v1/chat/completions` - Chat completions 
 
 ## License
 
-MIT
+项目基于 MIT Licence 开源，但是这个readme里面的一些图片除外，它们是保留所有权利的。
+
+## 铁打的距离感
+
+![dist](readmeme/dist.png)
