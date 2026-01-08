@@ -5,7 +5,6 @@ const PORT = process.env.PORT || 3000;
 const TARGET_API = "https://xiamenlabs.com/api/chat/";
 const TIMEOUT_MS = 120000;
 
-// 标签常量 - 使用拼接避免渲染问题
 const THINK_OPEN_TAG = String.fromCharCode(60) + "think" + String.fromCharCode(62);
 const THINK_CLOSE_TAG = String.fromCharCode(60) + "/think" + String.fromCharCode(62);
 
@@ -19,7 +18,6 @@ app.post("/v1/chat/completions", async (req, res) => {
   let reader = null;
   let aborted = false;
 
-  // 客户端断开处理
   req.on("close", () => {
     if (!res.writableEnded) {
       console.log(`[${new Date().toISOString()}] [${requestId}] Client disconnected`);
@@ -33,14 +31,11 @@ app.post("/v1/chat/completions", async (req, res) => {
   try {
     const { model, messages, stream = true, ...otherParams } = req.body;
 
-    // 参数校验
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({
         error: {
           message: "messages is required and must be a non-empty array",
           type: "invalid_request_error",
-          param: "messages",
-          code: null,
         },
       });
     }
@@ -52,7 +47,6 @@ app.post("/v1/chat/completions", async (req, res) => {
       ...otherParams,
     };
 
-    // 超时控制
     const controller = new AbortController();
     const timeout = setTimeout(() => {
       console.log(`[${new Date().toISOString()}] [${requestId}] Request timeout`);
@@ -95,12 +89,10 @@ app.post("/v1/chat/completions", async (req, res) => {
       });
     }
 
-    // 非流式响应处理
     if (!stream) {
       return await handleNonStreamResponse(response, model, res, requestId, startTime);
     }
 
-    // 流式响应处理
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -132,7 +124,7 @@ app.post("/v1/chat/completions", async (req, res) => {
         id: responseId,
         object: "chat.completion.chunk",
         created: responseCreated,
-        model: model || "gpt-4",
+        model: "unity",
         choices: [
           {
             index: 0,
@@ -158,85 +150,128 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     };
 
+    // 处理单个 SSE 数据
+    const processSSEData = (data) => {
+      if (!data || data === "[DONE]") {
+        return data === "[DONE]" ? "done" : null;
+      }
+
+      try {
+        const parsed = JSON.parse(data);
+        const choice = parsed.choices?.[0];
+
+        if (!choice) return null;
+
+        if (parsed.id) responseId = parsed.id;
+        if (parsed.created) responseCreated = parsed.created;
+
+        const delta = choice.delta || {};
+        const finishReason = choice.finish_reason;
+
+        // 处理 reasoning
+        if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
+          let content = "";
+
+          if (!isInReasoning) {
+            content = THINK_OPEN_TAG;
+            isInReasoning = true;
+          }
+
+          content += delta.reasoning;
+          sendChunk(content);
+          return "sent";
+        }
+        // 处理 content
+        else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
+          let content = "";
+
+          if (isInReasoning) {
+            content = THINK_CLOSE_TAG;
+            isInReasoning = false;
+          }
+
+          content += delta.content;
+          sendChunk(content);
+          return "sent";
+        }
+        // 处理 finish_reason (忽略带 usage 的最终 chunk，只处理 finish_reason)
+        else if (finishReason) {
+          closeReasoningIfNeeded();
+
+          const finalChunk = {
+            id: responseId,
+            object: "chat.completion.chunk",
+            created: responseCreated,
+            model: "unity",
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: finishReason,
+              },
+            ],
+          };
+          res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+          return "finish";
+        }
+
+        return null;
+      } catch (e) {
+        // JSON 解析失败，可能是不完整的数据，返回 null 让它继续缓冲
+        console.error(`[${requestId}] Parse error:`, e.message, "Data length:", data.length);
+        return "error";
+      }
+    };
+
     try {
       while (!aborted) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (aborted) break;
-          if (!line.trim() || line === ": connected" || line.startsWith(":")) continue;
-
-          if (line.startsWith("data: ")) {
-            const data = line.slice(6).trim();
-
+        
+        // 按 "data: " 分割处理
+        let dataStart;
+        while ((dataStart = buffer.indexOf("data: ")) !== -1) {
+          // 找到下一个 "data: " 或者 buffer 结尾
+          const nextDataStart = buffer.indexOf("data: ", dataStart + 6);
+          
+          if (nextDataStart === -1) {
+            // 没有下一个 data:，检查是否有完整的行（以 \n\n 结尾）
+            const lineEnd = buffer.indexOf("\n\n", dataStart);
+            if (lineEnd === -1) {
+              // 数据不完整，等待更多数据
+              break;
+            }
+            
+            const data = buffer.slice(dataStart + 6, lineEnd).trim();
+            buffer = buffer.slice(lineEnd + 2);
+            
             if (data === "[DONE]") {
               closeReasoningIfNeeded();
               res.write("data: [DONE]\n\n");
               continue;
             }
-
-            try {
-              const parsed = JSON.parse(data);
-              const choice = parsed.choices?.[0];
-
-              if (!choice) continue;
-
-              if (parsed.id) responseId = parsed.id;
-              if (parsed.created) responseCreated = parsed.created;
-
-              const delta = choice.delta || {};
-              const finishReason = choice.finish_reason;
-
-              // 处理 reasoning
-              if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
-                let content = "";
-
-                if (!isInReasoning) {
-                  content = THINK_OPEN_TAG;
-                  isInReasoning = true;
-                }
-
-                content += delta.reasoning;
-                sendChunk(content);
-              }
-              // 处理 content
-              else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
-                let content = "";
-
-                if (isInReasoning) {
-                  content = THINK_CLOSE_TAG;
-                  isInReasoning = false;
-                }
-
-                content += delta.content;
-                sendChunk(content);
-              }
-              // 处理 finish_reason
-              else if (finishReason) {
-                closeReasoningIfNeeded();
-
-                const finalChunk = {
-                  id: responseId,
-                  object: "chat.completion.chunk",
-                  created: responseCreated,
-                  model: model || "gpt-4",
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {},
-                      finish_reason: finishReason,
-                    },
-                  ],
-                };
-                res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-              }
-            } catch (e) {
-              console.error(`[${requestId}] Parse error:`, e.message, "Data:", data.slice(0, 100));
+            
+            if (data) {
+              processSSEData(data);
+            }
+          } else {
+            // 有下一个 data:，提取当前数据
+            const data = buffer.slice(dataStart + 6, nextDataStart).trim();
+            buffer = buffer.slice(nextDataStart);
+            
+            // 移除可能的换行符
+            const cleanData = data.replace(/\n+$/, "").trim();
+            
+            if (cleanData === "[DONE]") {
+              closeReasoningIfNeeded();
+              res.write("data: [DONE]\n\n");
+              continue;
+            }
+            
+            if (cleanData) {
+              processSSEData(cleanData);
             }
           }
         }
@@ -244,11 +279,21 @@ app.post("/v1/chat/completions", async (req, res) => {
 
       // 处理剩余 buffer
       if (!aborted && buffer.trim()) {
-        if (buffer.includes("[DONE]")) {
+        const remaining = buffer.trim();
+        if (remaining.includes("[DONE]")) {
           closeReasoningIfNeeded();
           res.write("data: [DONE]\n\n");
+        } else if (remaining.startsWith("data: ")) {
+          const data = remaining.slice(6).trim();
+          if (data && data !== "[DONE]") {
+            processSSEData(data);
+          }
         }
       }
+
+      // 确保发送 [DONE]
+      closeReasoningIfNeeded();
+      
     } finally {
       if (reader) {
         reader.releaseLock();
@@ -264,30 +309,19 @@ app.post("/v1/chat/completions", async (req, res) => {
     if (!res.headersSent) {
       if (error.name === "AbortError") {
         res.status(504).json({
-          error: {
-            message: "Request timeout",
-            type: "timeout_error",
-          },
+          error: { message: "Request timeout", type: "timeout_error" },
         });
       } else {
         res.status(500).json({
-          error: {
-            message: error.message || "Internal server error",
-            type: "server_error",
-          },
+          error: { message: error.message || "Internal server error", type: "server_error" },
         });
       }
     } else {
-      try {
-        res.end();
-      } catch (e) {
-        // ignore
-      }
+      try { res.end(); } catch (e) {}
     }
   }
 });
 
-// 非流式响应处理函数
 async function handleNonStreamResponse(response, model, res, requestId, startTime) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -304,52 +338,50 @@ async function handleNonStreamResponse(response, model, res, requestId, startTim
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
+    }
 
-      for (const line of lines) {
-        if (!line.trim() || line === ": connected" || line.startsWith(":")) continue;
+    // 处理完整的 buffer
+    const lines = buffer.split("\n");
+    
+    for (const line of lines) {
+      if (!line.trim() || !line.startsWith("data: ")) continue;
+      
+      const data = line.slice(6).trim();
+      if (data === "[DONE]") continue;
 
-        if (line.startsWith("data: ")) {
-          const data = line.slice(6).trim();
-          if (data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data);
+        const choice = parsed.choices?.[0];
 
-          try {
-            const parsed = JSON.parse(data);
-            const choice = parsed.choices?.[0];
+        if (!choice) continue;
 
-            if (!choice) continue;
+        if (parsed.id) responseId = parsed.id;
+        if (parsed.created) responseCreated = parsed.created;
 
-            if (parsed.id) responseId = parsed.id;
-            if (parsed.created) responseCreated = parsed.created;
+        const delta = choice.delta || {};
 
-            const delta = choice.delta || {};
-
-            if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
-              if (!isInReasoning) {
-                fullContent += THINK_OPEN_TAG;
-                isInReasoning = true;
-              }
-              fullContent += delta.reasoning;
-            } else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
-              if (isInReasoning) {
-                fullContent += THINK_CLOSE_TAG;
-                isInReasoning = false;
-              }
-              fullContent += delta.content;
-            }
-
-            if (choice.finish_reason) {
-              finishReason = choice.finish_reason;
-            }
-          } catch (e) {
-            console.error(`[${requestId}] Parse error:`, e.message);
+        if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
+          if (!isInReasoning) {
+            fullContent += THINK_OPEN_TAG;
+            isInReasoning = true;
           }
+          fullContent += delta.reasoning;
+        } else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
+          if (isInReasoning) {
+            fullContent += THINK_CLOSE_TAG;
+            isInReasoning = false;
+          }
+          fullContent += delta.content;
         }
+
+        if (choice.finish_reason) {
+          finishReason = choice.finish_reason;
+        }
+      } catch (e) {
+        // 忽略解析错误
       }
     }
 
-    // 确保关闭 reasoning 标签
     if (isInReasoning) {
       fullContent += THINK_CLOSE_TAG;
     }
@@ -358,7 +390,7 @@ async function handleNonStreamResponse(response, model, res, requestId, startTim
       id: responseId,
       object: "chat.completion",
       created: responseCreated,
-      model: model || "gpt-4",
+      model: "unity",
       choices: [
         {
           index: 0,
@@ -384,62 +416,23 @@ async function handleNonStreamResponse(response, model, res, requestId, startTim
   }
 }
 
-// 健康检查
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
+  res.json({ status: "ok", uptime: process.uptime() });
 });
 
-// 模型列表
 app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
     data: [
-      {
-        id: "gpt-4",
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "proxy",
-      },
+      { id: "unity", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "proxy" },
     ],
   });
 });
 
-// 404 处理
 app.use((req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Not found: ${req.method} ${req.path}`,
-      type: "not_found_error",
-    },
-  });
-});
-
-// 全局错误处理
-app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
-  res.status(500).json({
-    error: {
-      message: "Internal server error",
-      type: "server_error",
-    },
-  });
+  res.status(404).json({ error: { message: "Not found", type: "not_found_error" } });
 });
 
 app.listen(PORT, () => {
-  console.log("=".repeat(50));
-  console.log(`OpenAI Proxy Server Started`);
-  console.log("=".repeat(50));
-  console.log(`Port:     ${PORT}`);
-  console.log(`Target:   ${TARGET_API}`);
-  console.log(`Timeout:  ${TIMEOUT_MS / 1000}s`);
-  console.log("=".repeat(50));
-  console.log(`Endpoints:`);
-  console.log(`  POST /v1/chat/completions`);
-  console.log(`  GET  /v1/models`);
-  console.log(`  GET  /health`);
-  console.log("=".repeat(50));
+  console.log(`Proxy running on port ${PORT}`);
 });
