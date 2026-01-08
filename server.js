@@ -36,6 +36,8 @@ app.post("/v1/chat/completions", async (req, res) => {
         error: {
           message: "messages is required and must be a non-empty array",
           type: "invalid_request_error",
+          param: "messages",
+          code: null,
         },
       });
     }
@@ -84,15 +86,18 @@ app.post("/v1/chat/completions", async (req, res) => {
         error: {
           message: "Target API request failed",
           type: "api_error",
-          details: errorText,
+          param: null,
+          code: null,
         },
       });
     }
 
+    // 非流式响应
     if (!stream) {
-      return await handleNonStreamResponse(response, model, res, requestId, startTime);
+      return await handleNonStreamResponse(response, res, requestId, startTime);
     }
 
+    // 流式响应
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -106,35 +111,28 @@ app.post("/v1/chat/completions", async (req, res) => {
     let responseId = `chatcmpl-${Date.now()}`;
     let responseCreated = Math.floor(Date.now() / 1000);
 
-    const sendChunk = (content, finishReason = null) => {
-      if (aborted) return false;
-
-      const delta = {};
-
-      if (isFirstChunk) {
-        delta.role = "assistant";
-        isFirstChunk = false;
-      }
-
-      if (content !== null && content !== undefined) {
-        delta.content = content;
-      }
-
-      const chunk = {
+    const createChunk = (delta, finishReason = null) => {
+      return {
         id: responseId,
         object: "chat.completion.chunk",
         created: responseCreated,
         model: "unity",
+        system_fingerprint: "fp_proxy",
         choices: [
           {
             index: 0,
-            delta,
+            delta: delta,
+            logprobs: null,
             finish_reason: finishReason,
           },
         ],
       };
+    };
 
+    const sendChunk = (delta, finishReason = null) => {
+      if (aborted) return false;
       try {
+        const chunk = createChunk(delta, finishReason);
         res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         return true;
       } catch (e) {
@@ -145,12 +143,11 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     const closeReasoningIfNeeded = () => {
       if (isInReasoning) {
-        sendChunk(THINK_CLOSE_TAG);
+        sendChunk({ content: THINK_CLOSE_TAG }, null);
         isInReasoning = false;
       }
     };
 
-    // 处理单个 SSE 数据
     const processSSEData = (data) => {
       if (!data || data === "[DONE]") {
         return data === "[DONE]" ? "done" : null;
@@ -168,57 +165,44 @@ app.post("/v1/chat/completions", async (req, res) => {
         const delta = choice.delta || {};
         const finishReason = choice.finish_reason;
 
+        // 第一个 chunk: 发送 role
+        if (isFirstChunk) {
+          sendChunk({ role: "assistant", content: "" }, null);
+          isFirstChunk = false;
+        }
+
         // 处理 reasoning
         if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
           let content = "";
-
           if (!isInReasoning) {
             content = THINK_OPEN_TAG;
             isInReasoning = true;
           }
-
           content += delta.reasoning;
-          sendChunk(content);
+          sendChunk({ content: content }, null);
           return "sent";
         }
         // 处理 content
         else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
           let content = "";
-
           if (isInReasoning) {
             content = THINK_CLOSE_TAG;
             isInReasoning = false;
           }
-
           content += delta.content;
-          sendChunk(content);
+          sendChunk({ content: content }, null);
           return "sent";
         }
-        // 处理 finish_reason (忽略带 usage 的最终 chunk，只处理 finish_reason)
+        // 处理 finish_reason
         else if (finishReason) {
           closeReasoningIfNeeded();
-
-          const finalChunk = {
-            id: responseId,
-            object: "chat.completion.chunk",
-            created: responseCreated,
-            model: "unity",
-            choices: [
-              {
-                index: 0,
-                delta: {},
-                finish_reason: finishReason,
-              },
-            ],
-          };
-          res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
+          sendChunk({}, finishReason);
           return "finish";
         }
 
         return null;
       } catch (e) {
-        // JSON 解析失败，可能是不完整的数据，返回 null 让它继续缓冲
-        console.error(`[${requestId}] Parse error:`, e.message, "Data length:", data.length);
+        console.error(`[${requestId}] Parse error:`, e.message);
         return "error";
       }
     };
@@ -229,71 +213,43 @@ app.post("/v1/chat/completions", async (req, res) => {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        
-        // 按 "data: " 分割处理
-        let dataStart;
-        while ((dataStart = buffer.indexOf("data: ")) !== -1) {
-          // 找到下一个 "data: " 或者 buffer 结尾
-          const nextDataStart = buffer.indexOf("data: ", dataStart + 6);
-          
-          if (nextDataStart === -1) {
-            // 没有下一个 data:，检查是否有完整的行（以 \n\n 结尾）
-            const lineEnd = buffer.indexOf("\n\n", dataStart);
-            if (lineEnd === -1) {
-              // 数据不完整，等待更多数据
-              break;
-            }
-            
-            const data = buffer.slice(dataStart + 6, lineEnd).trim();
-            buffer = buffer.slice(lineEnd + 2);
-            
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (aborted) break;
+          const trimmedLine = line.trim();
+          if (!trimmedLine || trimmedLine.startsWith(":")) continue;
+
+          if (trimmedLine.startsWith("data:")) {
+            const data = trimmedLine.slice(5).trim();
             if (data === "[DONE]") {
               closeReasoningIfNeeded();
               res.write("data: [DONE]\n\n");
               continue;
             }
-            
             if (data) {
               processSSEData(data);
-            }
-          } else {
-            // 有下一个 data:，提取当前数据
-            const data = buffer.slice(dataStart + 6, nextDataStart).trim();
-            buffer = buffer.slice(nextDataStart);
-            
-            // 移除可能的换行符
-            const cleanData = data.replace(/\n+$/, "").trim();
-            
-            if (cleanData === "[DONE]") {
-              closeReasoningIfNeeded();
-              res.write("data: [DONE]\n\n");
-              continue;
-            }
-            
-            if (cleanData) {
-              processSSEData(cleanData);
             }
           }
         }
       }
 
-      // 处理剩余 buffer
       if (!aborted && buffer.trim()) {
-        const remaining = buffer.trim();
-        if (remaining.includes("[DONE]")) {
-          closeReasoningIfNeeded();
-          res.write("data: [DONE]\n\n");
-        } else if (remaining.startsWith("data: ")) {
-          const data = remaining.slice(6).trim();
-          if (data && data !== "[DONE]") {
+        const trimmedBuffer = buffer.trim();
+        if (trimmedBuffer.startsWith("data:")) {
+          const data = trimmedBuffer.slice(5).trim();
+          if (data === "[DONE]") {
+            closeReasoningIfNeeded();
+            res.write("data: [DONE]\n\n");
+          } else if (data) {
             processSSEData(data);
           }
         }
       }
 
-      // 确保发送 [DONE]
       closeReasoningIfNeeded();
-      
+
     } finally {
       if (reader) {
         reader.releaseLock();
@@ -309,11 +265,11 @@ app.post("/v1/chat/completions", async (req, res) => {
     if (!res.headersSent) {
       if (error.name === "AbortError") {
         res.status(504).json({
-          error: { message: "Request timeout", type: "timeout_error" },
+          error: { message: "Request timeout", type: "timeout_error", param: null, code: null },
         });
       } else {
         res.status(500).json({
-          error: { message: error.message || "Internal server error", type: "server_error" },
+          error: { message: error.message || "Internal server error", type: "server_error", param: null, code: null },
         });
       }
     } else {
@@ -322,7 +278,8 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 });
 
-async function handleNonStreamResponse(response, model, res, requestId, startTime) {
+// 非流式响应处理 - 符合 OpenAI 官方格式
+async function handleNonStreamResponse(response, res, requestId, startTime) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
@@ -336,17 +293,16 @@ async function handleNonStreamResponse(response, model, res, requestId, startTim
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-
       buffer += decoder.decode(value, { stream: true });
     }
 
-    // 处理完整的 buffer
     const lines = buffer.split("\n");
-    
+
     for (const line of lines) {
-      if (!line.trim() || !line.startsWith("data: ")) continue;
-      
-      const data = line.slice(6).trim();
+      const trimmedLine = line.trim();
+      if (!trimmedLine || !trimmedLine.startsWith("data:")) continue;
+
+      const data = trimmedLine.slice(5).trim();
       if (data === "[DONE]") continue;
 
       try {
@@ -386,6 +342,7 @@ async function handleNonStreamResponse(response, model, res, requestId, startTim
       fullContent += THINK_CLOSE_TAG;
     }
 
+    // 符合 OpenAI 官方格式的响应
     const result = {
       id: responseId,
       object: "chat.completion",
@@ -397,7 +354,10 @@ async function handleNonStreamResponse(response, model, res, requestId, startTim
           message: {
             role: "assistant",
             content: fullContent,
+            refusal: null,
+            annotations: [],
           },
+          logprobs: null,
           finish_reason: finishReason,
         },
       ],
@@ -405,7 +365,19 @@ async function handleNonStreamResponse(response, model, res, requestId, startTim
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0,
+        prompt_tokens_details: {
+          cached_tokens: 0,
+          audio_tokens: 0,
+        },
+        completion_tokens_details: {
+          reasoning_tokens: 0,
+          audio_tokens: 0,
+          accepted_prediction_tokens: 0,
+          rejected_prediction_tokens: 0,
+        },
       },
+      service_tier: "default",
+      system_fingerprint: "fp_proxy",
     };
 
     console.log(`[${new Date().toISOString()}] [${requestId}] Non-stream completed in ${Date.now() - startTime}ms`);
@@ -424,13 +396,20 @@ app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
     data: [
-      { id: "unity", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "proxy" },
+      {
+        id: "unity",
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "proxy",
+      },
     ],
   });
 });
 
 app.use((req, res) => {
-  res.status(404).json({ error: { message: "Not found", type: "not_found_error" } });
+  res.status(404).json({
+    error: { message: "Not found", type: "not_found_error", param: null, code: null },
+  });
 });
 
 app.listen(PORT, () => {
