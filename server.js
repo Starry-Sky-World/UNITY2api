@@ -13,14 +13,22 @@ app.use(express.json());
 app.post("/v1/chat/completions", async (req, res) => {
   const startTime = Date.now();
   const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  console.log(`[${new Date().toISOString()}] [${requestId}] New request`);
+  
+  // 打印完整请求信息
+  console.log(`[${requestId}] ========== NEW REQUEST ==========`);
+  console.log(`[${requestId}] Body:`, JSON.stringify(req.body, null, 2));
+  
+  const { model, messages, stream, ...otherParams } = req.body;
+  const isStream = stream !== false; // 默认 true
+  
+  console.log(`[${requestId}] Stream mode:`, isStream);
 
   let reader = null;
   let aborted = false;
 
   req.on("close", () => {
     if (!res.writableEnded) {
-      console.log(`[${new Date().toISOString()}] [${requestId}] Client disconnected`);
+      console.log(`[${requestId}] Client disconnected (aborted)`);
       aborted = true;
       if (reader) {
         reader.cancel().catch(() => {});
@@ -29,8 +37,6 @@ app.post("/v1/chat/completions", async (req, res) => {
   });
 
   try {
-    const { model, messages, stream = true, ...otherParams } = req.body;
-
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({
         error: {
@@ -49,11 +55,10 @@ app.post("/v1/chat/completions", async (req, res) => {
       ...otherParams,
     };
 
+    console.log(`[${requestId}] Sending to target API...`);
+
     const controller = new AbortController();
-    const timeout = setTimeout(() => {
-      console.log(`[${new Date().toISOString()}] [${requestId}] Request timeout`);
-      controller.abort();
-    }, TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
     let response;
     try {
@@ -79,9 +84,12 @@ app.post("/v1/chat/completions", async (req, res) => {
       clearTimeout(timeout);
     }
 
+    console.log(`[${requestId}] Target API response status:`, response.status);
+    console.log(`[${requestId}] Target API response headers:`, Object.fromEntries(response.headers.entries()));
+
     if (!response.ok) {
       const errorText = await response.text();
-      console.log(`[${new Date().toISOString()}] [${requestId}] Target API error: ${response.status} - ${errorText}`);
+      console.log(`[${requestId}] Target API error body:`, errorText);
       return res.status(response.status).json({
         error: {
           message: "Target API request failed",
@@ -93,15 +101,18 @@ app.post("/v1/chat/completions", async (req, res) => {
     }
 
     // 非流式响应
-    if (!stream) {
+    if (!isStream) {
+      console.log(`[${requestId}] Handling non-stream response...`);
       return await handleNonStreamResponse(response, res, requestId, startTime);
     }
 
     // 流式响应
+    console.log(`[${requestId}] Setting SSE headers...`);
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders(); // 立即发送 headers
 
     reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -133,7 +144,9 @@ app.post("/v1/chat/completions", async (req, res) => {
       if (aborted) return false;
       try {
         const chunk = createChunk(delta, finishReason);
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        const data = `data: ${JSON.stringify(chunk)}\n\n`;
+        console.log(`[${requestId}] Sending chunk:`, data.substring(0, 150));
+        res.write(data);
         return true;
       } catch (e) {
         console.error(`[${requestId}] Write error:`, e.message);
@@ -153,19 +166,22 @@ app.post("/v1/chat/completions", async (req, res) => {
         return data === "[DONE]" ? "done" : null;
       }
 
-      // 调试：打印原始数据
-      console.log(`[${requestId}] Raw SSE data:`, data.substring(0, 200));
+      console.log(`[${requestId}] Processing SSE data:`, data.substring(0, 200));
 
       let parsed;
       try {
         parsed = JSON.parse(data);
       } catch (e) {
-        console.error(`[${requestId}] JSON parse error:`, e.message, "Data:", data.substring(0, 100));
+        console.error(`[${requestId}] JSON parse error:`, e.message);
+        console.error(`[${requestId}] Failed data:`, data);
         return "error";
       }
 
       const choice = parsed.choices?.[0];
-      if (!choice) return null;
+      if (!choice) {
+        console.log(`[${requestId}] No choice in parsed data`);
+        return null;
+      }
 
       if (parsed.id) responseId = parsed.id;
       if (parsed.created) responseCreated = parsed.created;
@@ -211,16 +227,21 @@ app.post("/v1/chat/completions", async (req, res) => {
       return null;
     };
 
+    console.log(`[${requestId}] Starting to read stream...`);
+
     try {
       while (!aborted) {
         const { done, value } = await reader.read();
-        if (done) break;
+        
+        if (done) {
+          console.log(`[${requestId}] Stream ended (done=true)`);
+          break;
+        }
 
         const chunk = decoder.decode(value, { stream: true });
+        console.log(`[${requestId}] Received chunk (${chunk.length} bytes):`, chunk.substring(0, 100));
+        
         buffer += chunk;
-
-        // 调试：打印原始 chunk
-        console.log(`[${requestId}] Raw chunk:`, chunk.substring(0, 100));
 
         // 使用双换行符分割 SSE 事件
         let eventEnd;
@@ -236,6 +257,7 @@ app.post("/v1/chat/completions", async (req, res) => {
             if (trimmedLine.startsWith("data:")) {
               const data = trimmedLine.substring(5).trim();
               if (data === "[DONE]") {
+                console.log(`[${requestId}] Received [DONE]`);
                 closeReasoningIfNeeded();
                 res.write("data: [DONE]\n\n");
               } else if (data) {
@@ -248,7 +270,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 
       // 处理剩余 buffer
       if (!aborted && buffer.trim()) {
-        console.log(`[${requestId}] Remaining buffer:`, buffer.substring(0, 200));
+        console.log(`[${requestId}] Processing remaining buffer:`, buffer);
         const lines = buffer.split("\n");
         for (const line of lines) {
           const trimmedLine = line.trim();
@@ -272,11 +294,11 @@ app.post("/v1/chat/completions", async (req, res) => {
       }
     }
 
-    console.log(`[${new Date().toISOString()}] [${requestId}] Completed in ${Date.now() - startTime}ms`);
+    console.log(`[${requestId}] Completed in ${Date.now() - startTime}ms`);
     res.end();
 
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] [${requestId}] Error:`, error.message);
+    console.error(`[${requestId}] Error:`, error);
 
     if (!res.headersSent) {
       if (error.name === "AbortError") {
@@ -306,17 +328,15 @@ async function handleNonStreamResponse(response, res, requestId, startTime) {
   let finishReason = "stop";
 
   try {
-    // 读取所有数据
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
     }
 
-    console.log(`[${requestId}] Full response buffer length:`, buffer.length);
-    console.log(`[${requestId}] First 500 chars:`, buffer.substring(0, 500));
+    console.log(`[${requestId}] Non-stream buffer length:`, buffer.length);
+    console.log(`[${requestId}] Non-stream first 500 chars:`, buffer.substring(0, 500));
 
-    // 按双换行符分割事件
     const events = buffer.split("\n\n");
 
     for (const event of events) {
@@ -359,7 +379,7 @@ async function handleNonStreamResponse(response, res, requestId, startTime) {
               finishReason = choice.finish_reason;
             }
           } catch (e) {
-            console.error(`[${requestId}] Parse error in non-stream:`, e.message, "Line:", trimmedLine.substring(0, 100));
+            console.error(`[${requestId}] Non-stream parse error:`, e.message);
           }
         }
       }
@@ -406,7 +426,7 @@ async function handleNonStreamResponse(response, res, requestId, startTime) {
       system_fingerprint: "fp_proxy",
     };
 
-    console.log(`[${new Date().toISOString()}] [${requestId}] Non-stream completed in ${Date.now() - startTime}ms, content length: ${fullContent.length}`);
+    console.log(`[${requestId}] Sending non-stream response, content length:`, fullContent.length);
     res.json(result);
 
   } finally {
@@ -422,12 +442,7 @@ app.get("/v1/models", (req, res) => {
   res.json({
     object: "list",
     data: [
-      {
-        id: "unity",
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "proxy",
-      },
+      { id: "unity", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "proxy" },
     ],
   });
 });
