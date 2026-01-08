@@ -81,7 +81,7 @@ app.post("/v1/chat/completions", async (req, res) => {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.log(`[${new Date().toISOString()}] [${requestId}] Target API error: ${response.status}`);
+      console.log(`[${new Date().toISOString()}] [${requestId}] Target API error: ${response.status} - ${errorText}`);
       return res.status(response.status).json({
         error: {
           message: "Target API request failed",
@@ -153,58 +153,62 @@ app.post("/v1/chat/completions", async (req, res) => {
         return data === "[DONE]" ? "done" : null;
       }
 
+      // 调试：打印原始数据
+      console.log(`[${requestId}] Raw SSE data:`, data.substring(0, 200));
+
+      let parsed;
       try {
-        const parsed = JSON.parse(data);
-        const choice = parsed.choices?.[0];
-
-        if (!choice) return null;
-
-        if (parsed.id) responseId = parsed.id;
-        if (parsed.created) responseCreated = parsed.created;
-
-        const delta = choice.delta || {};
-        const finishReason = choice.finish_reason;
-
-        // 第一个 chunk: 发送 role
-        if (isFirstChunk) {
-          sendChunk({ role: "assistant", content: "" }, null);
-          isFirstChunk = false;
-        }
-
-        // 处理 reasoning
-        if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
-          let content = "";
-          if (!isInReasoning) {
-            content = THINK_OPEN_TAG;
-            isInReasoning = true;
-          }
-          content += delta.reasoning;
-          sendChunk({ content: content }, null);
-          return "sent";
-        }
-        // 处理 content
-        else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
-          let content = "";
-          if (isInReasoning) {
-            content = THINK_CLOSE_TAG;
-            isInReasoning = false;
-          }
-          content += delta.content;
-          sendChunk({ content: content }, null);
-          return "sent";
-        }
-        // 处理 finish_reason
-        else if (finishReason) {
-          closeReasoningIfNeeded();
-          sendChunk({}, finishReason);
-          return "finish";
-        }
-
-        return null;
+        parsed = JSON.parse(data);
       } catch (e) {
-        console.error(`[${requestId}] Parse error:`, e.message);
+        console.error(`[${requestId}] JSON parse error:`, e.message, "Data:", data.substring(0, 100));
         return "error";
       }
+
+      const choice = parsed.choices?.[0];
+      if (!choice) return null;
+
+      if (parsed.id) responseId = parsed.id;
+      if (parsed.created) responseCreated = parsed.created;
+
+      const delta = choice.delta || {};
+      const finishReason = choice.finish_reason;
+
+      // 第一个 chunk: 发送 role
+      if (isFirstChunk) {
+        sendChunk({ role: "assistant", content: "" }, null);
+        isFirstChunk = false;
+      }
+
+      // 处理 reasoning
+      if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
+        let content = "";
+        if (!isInReasoning) {
+          content = THINK_OPEN_TAG;
+          isInReasoning = true;
+        }
+        content += delta.reasoning;
+        sendChunk({ content: content }, null);
+        return "sent";
+      }
+      // 处理 content
+      else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
+        let content = "";
+        if (isInReasoning) {
+          content = THINK_CLOSE_TAG;
+          isInReasoning = false;
+        }
+        content += delta.content;
+        sendChunk({ content: content }, null);
+        return "sent";
+      }
+      // 处理 finish_reason
+      else if (finishReason) {
+        closeReasoningIfNeeded();
+        sendChunk({}, finishReason);
+        return "finish";
+      }
+
+      return null;
     };
 
     try {
@@ -212,38 +216,50 @@ app.post("/v1/chat/completions", async (req, res) => {
         const { done, value } = await reader.read();
         if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+        const chunk = decoder.decode(value, { stream: true });
+        buffer += chunk;
 
-        for (const line of lines) {
-          if (aborted) break;
-          const trimmedLine = line.trim();
-          if (!trimmedLine || trimmedLine.startsWith(":")) continue;
+        // 调试：打印原始 chunk
+        console.log(`[${requestId}] Raw chunk:`, chunk.substring(0, 100));
 
-          if (trimmedLine.startsWith("data:")) {
-            const data = trimmedLine.slice(5).trim();
-            if (data === "[DONE]") {
-              closeReasoningIfNeeded();
-              res.write("data: [DONE]\n\n");
-              continue;
-            }
-            if (data) {
-              processSSEData(data);
+        // 使用双换行符分割 SSE 事件
+        let eventEnd;
+        while ((eventEnd = buffer.indexOf("\n\n")) !== -1) {
+          const event = buffer.substring(0, eventEnd);
+          buffer = buffer.substring(eventEnd + 2);
+
+          const lines = event.split("\n");
+          for (const line of lines) {
+            const trimmedLine = line.trim();
+            if (!trimmedLine || trimmedLine.startsWith(":")) continue;
+
+            if (trimmedLine.startsWith("data:")) {
+              const data = trimmedLine.substring(5).trim();
+              if (data === "[DONE]") {
+                closeReasoningIfNeeded();
+                res.write("data: [DONE]\n\n");
+              } else if (data) {
+                processSSEData(data);
+              }
             }
           }
         }
       }
 
+      // 处理剩余 buffer
       if (!aborted && buffer.trim()) {
-        const trimmedBuffer = buffer.trim();
-        if (trimmedBuffer.startsWith("data:")) {
-          const data = trimmedBuffer.slice(5).trim();
-          if (data === "[DONE]") {
-            closeReasoningIfNeeded();
-            res.write("data: [DONE]\n\n");
-          } else if (data) {
-            processSSEData(data);
+        console.log(`[${requestId}] Remaining buffer:`, buffer.substring(0, 200));
+        const lines = buffer.split("\n");
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (trimmedLine.startsWith("data:")) {
+            const data = trimmedLine.substring(5).trim();
+            if (data === "[DONE]") {
+              closeReasoningIfNeeded();
+              res.write("data: [DONE]\n\n");
+            } else if (data) {
+              processSSEData(data);
+            }
           }
         }
       }
@@ -278,7 +294,7 @@ app.post("/v1/chat/completions", async (req, res) => {
   }
 });
 
-// 非流式响应处理 - 符合 OpenAI 官方格式
+// 非流式响应
 async function handleNonStreamResponse(response, res, requestId, startTime) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -290,51 +306,62 @@ async function handleNonStreamResponse(response, res, requestId, startTime) {
   let finishReason = "stop";
 
   try {
+    // 读取所有数据
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
     }
 
-    const lines = buffer.split("\n");
+    console.log(`[${requestId}] Full response buffer length:`, buffer.length);
+    console.log(`[${requestId}] First 500 chars:`, buffer.substring(0, 500));
 
-    for (const line of lines) {
-      const trimmedLine = line.trim();
-      if (!trimmedLine || !trimmedLine.startsWith("data:")) continue;
+    // 按双换行符分割事件
+    const events = buffer.split("\n\n");
 
-      const data = trimmedLine.slice(5).trim();
-      if (data === "[DONE]") continue;
+    for (const event of events) {
+      const lines = event.split("\n");
+      
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine || trimmedLine.startsWith(":")) continue;
 
-      try {
-        const parsed = JSON.parse(data);
-        const choice = parsed.choices?.[0];
+        if (trimmedLine.startsWith("data:")) {
+          const data = trimmedLine.substring(5).trim();
+          if (!data || data === "[DONE]") continue;
 
-        if (!choice) continue;
+          try {
+            const parsed = JSON.parse(data);
+            const choice = parsed.choices?.[0];
 
-        if (parsed.id) responseId = parsed.id;
-        if (parsed.created) responseCreated = parsed.created;
+            if (!choice) continue;
 
-        const delta = choice.delta || {};
+            if (parsed.id) responseId = parsed.id;
+            if (parsed.created) responseCreated = parsed.created;
 
-        if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
-          if (!isInReasoning) {
-            fullContent += THINK_OPEN_TAG;
-            isInReasoning = true;
+            const delta = choice.delta || {};
+
+            if (delta.reasoning !== undefined && delta.reasoning !== null && delta.reasoning !== "") {
+              if (!isInReasoning) {
+                fullContent += THINK_OPEN_TAG;
+                isInReasoning = true;
+              }
+              fullContent += delta.reasoning;
+            } else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
+              if (isInReasoning) {
+                fullContent += THINK_CLOSE_TAG;
+                isInReasoning = false;
+              }
+              fullContent += delta.content;
+            }
+
+            if (choice.finish_reason) {
+              finishReason = choice.finish_reason;
+            }
+          } catch (e) {
+            console.error(`[${requestId}] Parse error in non-stream:`, e.message, "Line:", trimmedLine.substring(0, 100));
           }
-          fullContent += delta.reasoning;
-        } else if (delta.content !== undefined && delta.content !== null && delta.content !== "") {
-          if (isInReasoning) {
-            fullContent += THINK_CLOSE_TAG;
-            isInReasoning = false;
-          }
-          fullContent += delta.content;
         }
-
-        if (choice.finish_reason) {
-          finishReason = choice.finish_reason;
-        }
-      } catch (e) {
-        // 忽略解析错误
       }
     }
 
@@ -342,7 +369,6 @@ async function handleNonStreamResponse(response, res, requestId, startTime) {
       fullContent += THINK_CLOSE_TAG;
     }
 
-    // 符合 OpenAI 官方格式的响应
     const result = {
       id: responseId,
       object: "chat.completion",
@@ -380,7 +406,7 @@ async function handleNonStreamResponse(response, res, requestId, startTime) {
       system_fingerprint: "fp_proxy",
     };
 
-    console.log(`[${new Date().toISOString()}] [${requestId}] Non-stream completed in ${Date.now() - startTime}ms`);
+    console.log(`[${new Date().toISOString()}] [${requestId}] Non-stream completed in ${Date.now() - startTime}ms, content length: ${fullContent.length}`);
     res.json(result);
 
   } finally {
